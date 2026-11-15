@@ -1,10 +1,11 @@
 // Ember Radar's model for token-radar-01: one sealed snapshot in, one ranked board out.
 //
-// The board ranks EVERY rankable pre-token protocol in the snapshot (the watchlist is the floor,
-// never the ceiling): all 40 watchlist slugs plus every pre-token protocol below the floor that is
-// not an exchange and not a versioned pool. A protocol is pre-token when its record carries no token
-// (no market cap, no CoinGecko id, no symbol); the live-token protocols are kept apart and shown with
-// the market's own values, never mixed into the ranking.
+// The board ranks every rankable pre-token protocol below the floor (the watchlist is the floor,
+// never the ceiling): all 40 watchlist slugs plus every pre-token protocol below $50M of TVL that
+// is not an exchange and not a versioned pool. A protocol is pre-token when its record carries no
+// token at all — no market cap, no CoinGecko id, no symbol. The live-token protocols are kept apart
+// and shown with the market's own values, never mixed into the ranking, because a token that already
+// trades has a price and a model would only pretend to know better.
 //
 // Implied value follows only from the snapshot's own figures, one function for every row:
 //
@@ -14,13 +15,13 @@
 //   maturity   = 0.5 + min(age_days, 1095) / 1095 x 0.5 (a long tokenless run is the other signal)
 //   implied    = max(1, round(base x growthMult x maturity))
 //
-// Momentum is weighted harder than the starter's house model because a 7-day TVL move is the only
-// forward-looking figure the snapshot carries: a protocol growing 100% in a week is behaving like a
-// launch is near, and one shrinking 50% is behaving like the market has moved on. Maturity runs
-// 0.5 to 1.0 over three years: a protocol that has held TVL for years with no token has more pent-up
-// value than one listed last month. No protocol name is ever special-cased: the same function scores
-// every row, and the dashboard's model sandbox lets a reader change the constants and watch the
-// ranking move, which is the proof the model is derived, not hardcoded.
+// Why momentum weighs 0.8: the seven-day TVL move is the only forward-looking figure the snapshot
+// carries. A protocol growing 100% in a week is behaving like a launch is near, and one shrinking
+// 50% is behaving like the market has moved on. Maturity runs 0.5 to 1.0 over three years: a
+// protocol that has held TVL for years with no token has more pent-up value than one listed last
+// month. No protocol name is ever special-cased — the same function scores every row — and the
+// dashboard's model sandbox lets a reader change the constants and watch the ranking move, which is
+// the proof the model is derived from the figures, not hardcoded to names.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -286,37 +287,68 @@ function holdDaysFor(age: number | null): number {
   return 30;
 }
 
+/** One category rule: the category words it matches, and the action it writes for a farm position. */
+interface CategoryAction {
+  words: string[];
+  make: (name: string, capital: number, chain: string) => string;
+}
+
+/** The category's actions, first match wins, in the order the snapshot's categories are most common. */
+const CATEGORY_ACTIONS: CategoryAction[] = [
+  { words: ['lend', 'cdp', 'collateral', 'nft lend'], make: (name, capital, chain) => `Supply $${capital} of USDC to ${name} on ${chain} and keep the position open.` },
+  { words: ['dex', 'yield', 'leveraged farm'], make: (name, capital, chain) => `Provide $${capital} of liquidity to ${name}'s main pool on ${chain} and keep the position open.` },
+  { words: ['bridge'], make: (name, capital, chain) => `Bridge $${capital} of USDC to ${chain} through ${name} and use the bridged funds in its app.` },
+  { words: ['restak', 'liquid staking'], make: (name, capital, chain) => `Stake $${capital} of the chain's staking asset through ${name} and keep the receipt.` },
+  { words: ['perpetual', 'derivative', 'options'], make: (name, capital, chain) => `Deposit $${capital} of USDC as margin on ${name} and open one small hedge.` },
+  { words: ['prediction'], make: (name, capital, chain) => `Fund $${capital} and place one market position on ${name}.` },
+  { words: ['curator', 'allocator', 'risk curat'], make: (name, capital, chain) => `Deposit $${capital} into a ${name} vault on ${chain} and keep the shares.` },
+  { words: ['stable'], make: (name, capital, chain) => `Mint or deposit $${capital} of the stable asset through ${name} on ${chain}.` },
+  { words: ['rwa'], make: (name, capital, chain) => `Mint $${capital} of the protocol's yield asset on ${chain} and hold it.` },
+  { words: ['insurance'], make: (name, capital, chain) => `Buy $${capital} of cover from ${name} on ${chain} and keep the policy.` },
+  { words: ['index'], make: (name, capital, chain) => `Buy $${capital} of the ${name} index on ${chain} and hold the basket.` },
+  { words: ['oracle'], make: (name, capital, chain) => `Use $${capital} of the protocol's data feed through ${name} on ${chain} and keep the subscription.` },
+  { words: ['payment'], make: (name, capital, chain) => `Pay $${capital} through ${name} on ${chain} and keep the receipt.` },
+];
+
+/** What a protocol with no matching category does: a plain deposit, the same shape as the rest. */
+const DEFAULT_ACTION: CategoryAction = {
+  words: [],
+  make: (name, capital, chain) => `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`,
+};
+
+/** The first rule whose words appear in the category, else the default. */
+function actionRule(category: string | null): CategoryAction {
+  const c = (category ?? '').toLowerCase();
+  return CATEGORY_ACTIONS.find((r) => r.words.some((w) => c.includes(w))) ?? DEFAULT_ACTION;
+}
+
 /** The category's one action, in the words a farmer can follow. */
 function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
-  const c = (p.category ?? '').toLowerCase();
-  const name = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral') || c.includes('nft lend')) return `Supply $${capital} of USDC to ${name} on ${chain} and keep the position open.`;
-  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return `Provide $${capital} of liquidity to ${name}'s main pool on ${chain} and keep the position open.`;
-  if (c.includes('bridge')) return `Bridge $${capital} of USDC to ${chain} through ${name} and use the bridged funds in its app.`;
-  if (c.includes('restak') || c.includes('liquid staking')) return `Stake $${capital} of the chain's staking asset through ${name} and keep the receipt.`;
-  if (c.includes('perpetual') || c.includes('derivative') || c.includes('options')) return `Deposit $${capital} of USDC as margin on ${name} and open one small hedge.`;
-  if (c.includes('prediction')) return `Fund $${capital} and place one market position on ${name}.`;
-  if (c.includes('curator') || c.includes('allocator') || c.includes('risk curat')) return `Deposit $${capital} into a ${name} vault on ${chain} and keep the shares.`;
-  if (c.includes('stable')) return `Mint or deposit $${capital} of the stable asset through ${name} on ${chain}.`;
-  if (c.includes('rwa')) return `Mint $${capital} of the protocol's yield asset on ${chain} and hold it.`;
-  if (c.includes('insurance')) return `Buy $${capital} of cover from ${name} on ${chain} and keep the policy.`;
-  if (c.includes('index')) return `Buy $${capital} of the ${name} index on ${chain} and hold the basket.`;
-  if (c.includes('oracle')) return `Use $${capital} of the protocol's data feed through ${name} on ${chain} and keep the subscription.`;
-  if (c.includes('payment')) return `Pay $${capital} through ${name} on ${chain} and keep the receipt.`;
-  return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
+  return actionRule(p.category).make(p.name, capital, chain);
 }
+
+/** One weekly rule: the category words it matches, and the recurring action it writes. */
+interface WeeklyAction {
+  words: string[];
+  text: string;
+}
+
+/** The weekly actions, first match wins, so the activity reads as use of the protocol, not a deposit. */
+const WEEKLY_ACTIONS: WeeklyAction[] = [
+  { words: ['lend', 'cdp'], text: 'Make one qualifying action each week, such as a supply, a borrow or a repayment.' },
+  { words: ['dex', 'yield'], text: 'Make one qualifying action each week, such as a swap, a liquidity add or a fee claim.' },
+  { words: ['bridge'], text: 'Make one qualifying action each week, such as a bridge, a swap or a claim on the destination chain.' },
+  { words: ['restak', 'liquid staking'], text: 'Make one qualifying action each week, such as a stake, a restake or a reward claim.' },
+  { words: ['perpetual', 'derivative', 'options'], text: 'Make one qualifying action each week, such as a trade, a hedge or a funding claim.' },
+  { words: ['prediction'], text: 'Make one qualifying action each week, such as a market position or a resolution claim.' },
+  { words: ['curator', 'allocator', 'risk curat'], text: 'Make one qualifying action each week, such as a vault deposit, a rebalance or a reward claim.' },
+];
 
 /** The weekly qualifying action, matched to the category so the activity reads as use, not a deposit. */
 function weeklyFor(p: SnapshotProtocol): string {
   const c = (p.category ?? '').toLowerCase();
-  if (c.includes('lend') || c.includes('cdp')) return 'Make one qualifying action each week, such as a supply, a borrow or a repayment.';
-  if (c.includes('dex') || c.includes('yield')) return 'Make one qualifying action each week, such as a swap, a liquidity add or a fee claim.';
-  if (c.includes('bridge')) return 'Make one qualifying action each week, such as a bridge, a swap or a claim on the destination chain.';
-  if (c.includes('restak') || c.includes('liquid staking')) return 'Make one qualifying action each week, such as a stake, a restake or a reward claim.';
-  if (c.includes('perpetual') || c.includes('derivative') || c.includes('options')) return 'Make one qualifying action each week, such as a trade, a hedge or a funding claim.';
-  if (c.includes('prediction')) return 'Make one qualifying action each week, such as a market position or a resolution claim.';
-  if (c.includes('curator') || c.includes('allocator') || c.includes('risk curat')) return 'Make one qualifying action each week, such as a vault deposit, a rebalance or a reward claim.';
-  return 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.';
+  const rule = WEEKLY_ACTIONS.find((r) => r.words.some((w) => c.includes(w)));
+  return rule?.text ?? 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.';
 }
 
 /**
@@ -423,49 +455,71 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
 }
 
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */
-export function parseSnapshot(text: string): Snapshot {
+/** The JSON text as an object, or a SnapshotError naming what is wrong with it. */
+function asObject(text: string): Record<string, unknown> {
   let raw: unknown;
   try {
     raw = JSON.parse(text);
   } catch {
     throw new SnapshotError('snapshot.json is not JSON');
   }
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new SnapshotError('snapshot.json is not a JSON object');
-  const o = raw as Record<string, unknown>;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new SnapshotError('snapshot.json is not a JSON object');
+  }
+  return raw as Record<string, unknown>;
+}
+
+/** A finite number field, or null when it is absent or not a number. */
+function numOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** A string field, or null when it is absent or not a string. */
+function strOrNull(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+/** One protocol entry out of a raw object, refused unless it carries a slug, a name and a TVL. */
+function protocolFrom(v: unknown, i: number): SnapshotProtocol {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+    throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
+  }
+  const p = v as Record<string, unknown>;
+  if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
+    throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
+  }
+  return {
+    slug: p.slug,
+    name: p.name,
+    category: strOrNull(p.category),
+    chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
+    tvl_usd: p.tvl_usd,
+    change_7d: numOrNull(p.change_7d),
+    mcap_usd: numOrNull(p.mcap_usd),
+    listed_at: strOrNull(p.listed_at),
+    gecko_id: strOrNull(p.gecko_id),
+    symbol: strOrNull(p.symbol),
+  };
+}
+
+/** The snapshot out of a file's text, refused unless it is the shape the model scores. */
+export function parseSnapshot(text: string): Snapshot {
+  const o = asObject(text);
   if (typeof o.as_of !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(o.as_of)) throw new SnapshotError('snapshot.json has no as_of date');
   if (typeof o.source !== 'string') throw new SnapshotError('snapshot.json has no source');
   if (typeof o.floor_usd !== 'number' || !Number.isSafeInteger(o.floor_usd) || o.floor_usd <= 0) throw new SnapshotError('snapshot.json has no floor_usd');
   if (!Array.isArray(o.protocols)) throw new SnapshotError('snapshot.json has no protocols array');
   if (!Array.isArray(o.watchlist) || o.watchlist.some((s) => typeof s !== 'string')) throw new SnapshotError('snapshot.json has no watchlist of slugs');
-  const protocols = o.protocols.map((v, i) => {
-    if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
-    const p = v as Record<string, unknown>;
-    if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
-      throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
-    }
-    return {
-      slug: p.slug,
-      name: p.name,
-      category: typeof p.category === 'string' ? p.category : null,
-      chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
-      tvl_usd: p.tvl_usd,
-      change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
-      listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
-      gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
-      symbol: typeof p.symbol === 'string' ? p.symbol : null,
-      mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
-    };
-  });
   return {
     as_of: o.as_of,
     source: o.source,
     floor_usd: o.floor_usd,
-    protocols,
+    protocols: o.protocols.map((v, i) => protocolFrom(v, i)),
     watchlist: o.watchlist as string[],
   };
 }
 
-/** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */
+/** Why a board is not one the gate will take, or null: it checks coverage, ranks, order, one shared implied value, and farm steps, in that order. */
 export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null {
   const slugs = new Set(board.map((r) => r.slug));
   const missing = snapshot.watchlist.filter((s) => !slugs.has(s));

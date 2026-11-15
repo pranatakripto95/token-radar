@@ -1,7 +1,9 @@
 // Ember Radar's dashboard. It reads window.RADAR (written beside dashboard/ by main.ts) and renders
-// the ranked board, a filterable and sortable table, a per-protocol detail drawer with the model's own
-// inputs and the protocol's farm plan, and a model sandbox that recomputes the ranking live. No
-// network: every byte it shows is in data.js.
+// the ranked board, a filterable and sortable table with a chain filter and a watchlist toggle, a
+// per-protocol detail drawer with the model's own inputs and the protocol's farm plan, and a model
+// sandbox that recomputes the ranking live from the reader's constants. No network: every byte it
+// shows is in data.js, and the page recomputes each row from the snapshot figures so the board's
+// numbers and the page's numbers are visibly the same arithmetic.
 (function () {
   'use strict';
 
@@ -83,33 +85,60 @@
     if (age < 365) return 45;
     return 30;
   }
-  function actionFor(p, capital, chain) {
-    var c = (p.category || '').toLowerCase();
-    var name = p.name;
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0 || c.indexOf('nft lend') >= 0) return 'Supply $' + capital + ' of USDC to ' + name + ' on ' + chain + ' and keep the position open.';
-    if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('leveraged farm') >= 0) return 'Provide $' + capital + ' of liquidity to ' + name + "'s main pool on " + chain + ' and keep the position open.';
-    if (c.indexOf('bridge') >= 0) return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + name + ' and use the bridged funds in its app.';
-    if (c.indexOf('restak') >= 0 || c.indexOf('liquid staking') >= 0) return "Stake $" + capital + " of the chain's staking asset through " + name + ' and keep the receipt.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0 || c.indexOf('options') >= 0) return 'Deposit $' + capital + ' of USDC as margin on ' + name + ' and open one small hedge.';
-    if (c.indexOf('prediction') >= 0) return 'Fund $' + capital + ' and place one market position on ' + name + '.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0 || c.indexOf('risk curat') >= 0) return 'Deposit $' + capital + ' into a ' + name + ' vault on ' + chain + ' and keep the shares.';
-    if (c.indexOf('stable') >= 0) return 'Mint or deposit $' + capital + ' of the stable asset through ' + name + ' on ' + chain + '.';
-    if (c.indexOf('rwa') >= 0) return "Mint $" + capital + " of the protocol's yield asset on " + chain + ' and hold it.';
-    if (c.indexOf('insurance') >= 0) return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy.';
-    if (c.indexOf('index') >= 0) return 'Buy $' + capital + ' of the ' + name + ' index on ' + chain + ' and hold the basket.';
-    if (c.indexOf('oracle') >= 0) return 'Use $' + capital + " of the protocol's data feed through " + name + ' on ' + chain + ' and keep the subscription.';
-    if (c.indexOf('payment') >= 0) return 'Pay $' + capital + ' through ' + name + ' on ' + chain + ' and keep the receipt.';
-    return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.';
+  // One category rule: the category words it matches, and the action it writes for a farm position.
+  // The table is the same derivation main.ts writes to board.json: category, chains, TVL and age
+  // decide the action, the capital, the hold and every cost and time. No name is special-cased.
+  var CATEGORY_ACTIONS = [
+    { words: ['lend', 'cdp', 'collateral', 'nft lend'], make: function (name, capital, chain) { return 'Supply $' + capital + ' of USDC to ' + name + ' on ' + chain + ' and keep the position open.'; } },
+    { words: ['dex', 'yield', 'leveraged farm'], make: function (name, capital, chain) { return 'Provide $' + capital + ' of liquidity to ' + name + "'s main pool on " + chain + ' and keep the position open.'; } },
+    { words: ['bridge'], make: function (name, capital, chain) { return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + name + ' and use the bridged funds in its app.'; } },
+    { words: ['restak', 'liquid staking'], make: function (name, capital, chain) { return "Stake $" + capital + " of the chain's staking asset through " + name + ' and keep the receipt.'; } },
+    { words: ['perpetual', 'derivative', 'options'], make: function (name, capital, chain) { return 'Deposit $' + capital + ' of USDC as margin on ' + name + ' and open one small hedge.'; } },
+    { words: ['prediction'], make: function (name, capital, chain) { return 'Fund $' + capital + ' and place one market position on ' + name + '.'; } },
+    { words: ['curator', 'allocator', 'risk curat'], make: function (name, capital, chain) { return 'Deposit $' + capital + ' into a ' + name + ' vault on ' + chain + ' and keep the shares.'; } },
+    { words: ['stable'], make: function (name, capital, chain) { return 'Mint or deposit $' + capital + ' of the stable asset through ' + name + ' on ' + chain + '.'; } },
+    { words: ['rwa'], make: function (name, capital, chain) { return "Mint $" + capital + " of the protocol's yield asset on " + chain + ' and hold it.'; } },
+    { words: ['insurance'], make: function (name, capital, chain) { return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy.'; } },
+    { words: ['index'], make: function (name, capital, chain) { return 'Buy $' + capital + ' of the ' + name + ' index on ' + chain + ' and hold the basket.'; } },
+    { words: ['oracle'], make: function (name, capital, chain) { return 'Use $' + capital + " of the protocol's data feed through " + name + ' on ' + chain + ' and keep the subscription.'; } },
+    { words: ['payment'], make: function (name, capital, chain) { return 'Pay $' + capital + ' through ' + name + ' on ' + chain + ' and keep the receipt.'; } }
+  ];
+  // What a protocol with no matching category does: a plain deposit, the same shape as the rest.
+  var DEFAULT_ACTION = { words: [], make: function (name, capital, chain) { return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.'; } };
+  // The first rule whose words appear in the category, else the default.
+  function actionRule(category) {
+    var c = (category || '').toLowerCase();
+    for (var i = 0; i < CATEGORY_ACTIONS.length; i++) {
+      var rule = CATEGORY_ACTIONS[i];
+      for (var j = 0; j < rule.words.length; j++) {
+        if (c.indexOf(rule.words[j]) >= 0) return rule;
+      }
+    }
+    return DEFAULT_ACTION;
   }
+  // The category's one action, in the words a farmer can follow.
+  function actionFor(p, capital, chain) {
+    return actionRule(p.category).make(p.name, capital, chain);
+  }
+  // One weekly rule: the category words it matches, and the recurring action it writes.
+  var WEEKLY_ACTIONS = [
+    { words: ['lend', 'cdp'], text: 'Make one qualifying action each week, such as a supply, a borrow or a repayment.' },
+    { words: ['dex', 'yield'], text: 'Make one qualifying action each week, such as a swap, a liquidity add or a fee claim.' },
+    { words: ['bridge'], text: 'Make one qualifying action each week, such as a bridge, a swap or a claim on the destination chain.' },
+    { words: ['restak', 'liquid staking'], text: 'Make one qualifying action each week, such as a stake, a restake or a reward claim.' },
+    { words: ['perpetual', 'derivative', 'options'], text: 'Make one qualifying action each week, such as a trade, a hedge or a funding claim.' },
+    { words: ['prediction'], text: 'Make one qualifying action each week, such as a market position or a resolution claim.' },
+    { words: ['curator', 'allocator', 'risk curat'], text: 'Make one qualifying action each week, such as a vault deposit, a rebalance or a reward claim.' }
+  ];
+  // The weekly qualifying action, matched to the category so the activity reads as use, not a deposit.
   function weeklyFor(p) {
     var c = (p.category || '').toLowerCase();
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0) return 'Make one qualifying action each week, such as a supply, a borrow or a repayment.';
-    if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0) return 'Make one qualifying action each week, such as a swap, a liquidity add or a fee claim.';
-    if (c.indexOf('bridge') >= 0) return 'Make one qualifying action each week, such as a bridge, a swap or a claim on the destination chain.';
-    if (c.indexOf('restak') >= 0 || c.indexOf('liquid staking') >= 0) return 'Make one qualifying action each week, such as a stake, a restake or a reward claim.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0 || c.indexOf('options') >= 0) return 'Make one qualifying action each week, such as a trade, a hedge or a funding claim.';
-    if (c.indexOf('prediction') >= 0) return 'Make one qualifying action each week, such as a market position or a resolution claim.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0 || c.indexOf('risk curat') >= 0) return 'Make one qualifying action each week, such as a vault deposit, a rebalance or a reward claim.';
+    for (var i = 0; i < WEEKLY_ACTIONS.length; i++) {
+      var rule = WEEKLY_ACTIONS[i];
+      for (var j = 0; j < rule.words.length; j++) {
+        if (c.indexOf(rule.words[j]) >= 0) return rule.text;
+      }
+    }
     return 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.';
   }
   function stepText(step) {
